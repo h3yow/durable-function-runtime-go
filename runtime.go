@@ -29,6 +29,8 @@ type Runtime struct {
 	reg   *Registry
 	store Store
 	pol   RetryPolicy
+	// compPol 为补偿动作独立的退避重试策略。
+	compPol RetryPolicy
 
 	sem   chan struct{} // 并发额度（中断式信号量）
 	slots int64         // 当前实际占用的步骤槽位数
@@ -64,6 +66,19 @@ func New(ctx context.Context, cfg Config, reg *Registry) (*Runtime, error) {
 	if pol.Multiplier <= 0 {
 		pol.Multiplier = 2
 	}
+	compPol := cfg.CompRetry
+	if compPol.MaxAttempts <= 0 {
+		compPol.MaxAttempts = 3
+	}
+	if compPol.Multiplier <= 0 {
+		compPol.Multiplier = 2
+	}
+	if compPol.InitialBackoff <= 0 {
+		compPol.InitialBackoff = 50 * time.Millisecond
+	}
+	if compPol.MaxBackoff <= 0 {
+		compPol.MaxBackoff = 2 * time.Second
+	}
 
 	store, err := NewFileStore(ctx, cfg.Dir)
 	if err != nil {
@@ -75,6 +90,7 @@ func New(ctx context.Context, cfg Config, reg *Registry) (*Runtime, error) {
 		reg:       reg,
 		store:     store,
 		pol:       pol,
+		compPol:   compPol,
 		sem:       make(chan struct{}, cfg.MaxConcurrent),
 		drivers:   map[string]*execDriver{},
 		wakeAll:   make(chan struct{}, 1),
@@ -318,7 +334,14 @@ func (rt *Runtime) recover(ctx context.Context) error {
 			code := rejectCodeFor(decision)
 			now := time.Now().UTC()
 			e.Status = ExecRejected
-			e.Failure = &Failure{Class: FailurePermanent, Code: code, Message: "on recovery: " + string(decision)}
+			rf := &Failure{Class: FailurePermanent, Code: code, Message: "on recovery: " + string(decision)}
+			if e.Compensation != nil {
+				// 补偿阶段版本不可用：拒绝原因记入补偿记录，
+				// 原始触发原因（Execution.Failure）必须保留，不被覆盖。
+				e.Compensation.Failure = rf
+			} else {
+				e.Failure = rf
+			}
 			e.UpdatedAt = now
 			for i := range e.Steps {
 				if e.Steps[i].Status != StepSucceeded {
@@ -353,6 +376,20 @@ func (rt *Runtime) recover(ctx context.Context) error {
 				changed = true
 			}
 		}
+		// 崩溃/中断留下的补偿中间态（running）不算已完成：
+		// 重置回 pending，恢复后从未补偿完的地方继续给出真实结论。
+		resetComps := []string{}
+		if e.Compensation != nil {
+			for i := range e.Compensation.Steps {
+				cs := &e.Compensation.Steps[i]
+				if cs.Status == CompRunning {
+					cs.Status = CompPending
+					cs.StartedAt = nil
+					resetComps = append(resetComps, cs.Name)
+					changed = true
+				}
+			}
+		}
 		if e.Status == ExecRunning {
 			e.Status = ExecPending
 			changed = true
@@ -371,8 +408,15 @@ func (rt *Runtime) recover(ctx context.Context) error {
 				Reason: "process restarted while step running; reset to pending for safe retry",
 			})
 		}
-		log.Printf("[durable] recovery: resumed execution=%s idempKey=%q status=%s resetSteps=%v",
-			id, e.IdempKey, e.Status, resetSteps)
+		for _, name := range resetComps {
+			_ = rt.appendEvent(e, Event{
+				Type:   EvRunningReset,
+				Step:   name,
+				Reason: "process restarted while compensation running; reset to pending so it is not mistaken as done",
+			})
+		}
+		log.Printf("[durable] recovery: resumed execution=%s idempKey=%q status=%s resetSteps=%v resetComps=%v",
+			id, e.IdempKey, e.Status, resetSteps, resetComps)
 		_ = rt.appendEvent(e, Event{Type: EvRecovered, IdempKey: e.IdempKey})
 	}
 	return nil
