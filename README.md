@@ -7,6 +7,8 @@
 - 进程重启后从首个未完成步骤继续，已完成步骤绝不重复执行；
 - 同一幂等键的并发重复提交收敛到同一执行；同键不同请求被明确拒绝；
 - 瞬时失败按有上限指数退避重试；永久失败、超时、取消立即进入可区分终态；
+- **可声明的失败补偿（回滚）**：正向流程无法走完时，对已成功的步骤按相反顺序
+  执行各自声明的补偿动作；补偿进度逐步落盘，重启后从未补偿完的地方继续；
 - 进行中的执行始终按**启动时钉住的定义版本**执行；未知 / 不兼容版本明确拒绝，
   绝不静默按新语义重放。
 
@@ -18,13 +20,16 @@ _ = reg.Register(durable.Definition{
     Name: "order-pipeline", Version: "1.0.0",
     Steps: []durable.Step{
         {Name: "validate", Fn: validateFn},
-        {Name: "charge",   Fn: chargeFn},
-        {Name: "ship", Timeout: 5 * time.Second, Fn: shipFn},
+        {Name: "charge",   Fn: chargeFn, Compensate: refundFn},              // 声明补偿
+        {Name: "ship", Timeout: 5 * time.Second, Fn: shipFn,
+            Compensate: recallFn, CompTimeout: 10 * time.Second},            // 补偿带独立超时
     },
 })
 
 rt, _ := durable.New(ctx, durable.Config{
-    Dir: "./state", MaxConcurrent: 8, Retry: durable.DefaultRetryPolicy(),
+    Dir: "./state", MaxConcurrent: 8,
+    Retry:     durable.DefaultRetryPolicy(), // 正向重试策略
+    CompRetry: durable.DefaultRetryPolicy(), // 补偿独立的重试策略
 }, reg)
 defer rt.Close()
 
@@ -73,11 +78,19 @@ state/
         └────┬─────┘
    ┌─────────┼──────────────┬─────────────────┐
    ▼         ▼              ▼                 ▼
-succeeded  failed       cancelled         timed_out
- (终态)  ┌───┴────┐        (终态)            (终态)
-         │永久失败 │
-         │重试上限 │
-         └────────┘
+succeeded  正向失败       cancelled         timed_out
+ (终态)  ┌───┴────┐        ▲                 ▲
+         │永久失败 │        └────────┬────────┘
+         │重试上限 │  有已成功且声明补偿的步骤
+         └───┬────┘                 ▼
+             │               ┌─────────────┐   全部补偿完成    回到正向终态
+             └─────────────▶ │ compensating │ ──────────────▶ (failed /
+                             └──────┬───────┘                  cancelled /
+                                    │ 补偿失败/超时/钉住版本不可用  timed_out)
+                                    ▼
+                          ┌────────────────────┐
+                          │ compensation_failed │ (终态，与正向失败可区分)
+                          └────────────────────┘
 ```
 
 - `failed` 用 `Failure.Code` 区分 `StepPermanent`（永久失败）与
@@ -85,7 +98,10 @@ succeeded  failed       cancelled         timed_out
 - `timed_out` 对应 `StepTimeout`，**超时不可重试**，立即终态；
 - `cancelled` 对应 `ExecutionCancelled`；
 - `rejected` 用 `Failure.Code` 区分 `DefUnknown` / `DefVersionIncompatible` /
-  `DefVersionMissing`。
+  `DefVersionMissing`；
+- `compensation_failed` 是补偿自身的独立终态，用 `Failure.Code` 区分
+  `CompensationPermanent` / `CompensationRetryLimitExceeded` /
+  `CompensationTimeout` / `CompDefVersionUnavailable`（见「失败补偿」一节）。
 
 ### 步骤级状态（`StepStatus`）
 
@@ -135,6 +151,56 @@ pending ──▶ running ──▶ succeeded（终态，重启后绝不重放�
   配对释放，终态后不存在悬挂执行、重复调度或被长期占用的额度（可用
   `rt.Inflight()` 观测，测试中已断言归零）。
 
+## 失败补偿（回滚）
+
+当一次执行因为**永久失败、重试次数用尽、步骤超时或被取消**而无法正常走完时，
+运行时会自动进入 `compensating` 阶段，对**已经执行成功、且在定义中声明了
+`Compensate` 动作**的步骤按**相反顺序**依次补偿：
+
+- **触发条件**：`StepPermanent` / `RetryLimitExceeded` / `StepTimeout` /
+  `ExecutionCancelled` 四种正向失败收尾路径；只要至少有一个已成功步骤声明了
+  补偿就进入补偿阶段，否则按原逻辑直接进入正向终态；
+- **执行顺序**：严格按正向步骤的逆序逐个补偿；未声明补偿的步骤标记为
+  `skipped`（追加 `compensation_step_skipped` 事件）直接跳过，不影响其它步骤；
+- **进度落盘**：补偿队列、每步状态（`pending/running/retrying/succeeded/
+  skipped/failed/timed_out`）、尝试次数、失败原因全部持久化在
+  `Execution.Comp` 中；进程重启后从**还没补偿完的地方**继续，已补偿成功的
+  步骤绝不重复补偿；崩溃时处于 `running` 的补偿动作复位为 `pending`
+  （副作用未确认，不被当作已完成）；
+- **原始原因保留**：触发补偿的原始原因（哪一步失败/超时/取消）保存在
+  `Comp.Trigger` 与 `Execution.Failure` 中，补偿全过程不被覆盖；
+- **收敛**：同一执行的补偿只触发一次——取消与超时同时发生、重启后又恢复等
+  重复触发都收敛到同一份补偿进度，不重复补偿、不重复扣次数。
+
+### 补偿自身的失败处理
+
+- 补偿动作使用**独立的**退避重试策略 `Config.CompRetry`（与正向 `Retry`
+  互不影响），同样有次数上限；退避等待期间不占用并发额度；
+- 补偿重试上限耗尽 / 永久失败 / 补偿超时 → 进入 **`compensation_failed`**
+  终态（`Failure.Code` 为 `CompensationRetryLimitExceeded` /
+  `CompensationPermanent` / `CompensationTimeout`），与正向流程失败的
+  `failed` 终态可区分；
+- 补偿动作支持步骤级超时 `Step.CompTimeout`：补偿函数在独立 goroutine 中
+  执行，即使它不理会取消信号，超时后也会尽快给出结论并**释放并发额度**，
+  不把额度一直拖着；
+- 补偿全部完成后，执行回到触发时的正向终态（`failed` / `cancelled` /
+  `timed_out`），并追加 `compensated` 事件；一次执行彻底结束后不留下悬挂
+  调度或长期占用的额度。
+
+### 补偿与定义版本
+
+- 补偿动作来自**启动时钉住的定义版本**：运行期注册新版本（包括新增/调整
+  补偿动作）只影响新提交的执行，已启动的执行及其进行中的补偿继续按旧版
+  语义走；
+- 补偿阶段若发现钉住版本已不可用（被 `Unregister`、主版本变更或精确版本
+  缺失），执行被明确拒绝：终态 `compensation_failed` +
+  `CompDefVersionUnavailable`（事件 `compensation_rejected` 携带
+  `versionDecision`），与补偿执行失败的原因码可区分，**绝不静默切换到
+  新版本去补偿**；
+- `Registry` 的注册/注销与并发读取（启动、推进、补偿时的版本判定）由
+  读写锁保护，可安全并发；同名同版本重复注册时补偿声明也属于步骤签名，
+  不一致即拒绝。
+
 ## 版本兼容规则
 
 定义以 `名称 + 语义化版本 (MAJOR.MINOR.PATCH)` 标识。执行在启动时把
@@ -142,10 +208,11 @@ pending ──▶ running ──▶ succeeded（终态，重启后绝不重放�
 
 | 恢复/推进时的注册情况 | 判定 (`VersionDecision`) | 终态原因码 | 处理 |
 | --- | --- | --- | --- |
-| 精确版本仍存在 | `accept_compatible` | — | 按钉住版本的步骤语义继续 |
+| 精确版本仍存在 | `accept_compatible` | — | 按钉住版本的步骤语义继续（含补偿动作） |
 | 名称已未知 | `def_unknown` | `DefUnknown` | 明确拒绝（启动与恢复都拒绝） |
 | 存在同名定义，但主版本不同 | `version_incompatible` | `DefVersionIncompatible` | 明确拒绝，绝不按新版本重放 |
 | 主版本相同但精确版本缺失 | `version_missing` | `DefVersionMissing` | 明确拒绝，不猜测兼容语义 |
+| 上述任一情况发生在**补偿阶段** | 同上 | `CompDefVersionUnavailable` | 拒绝补偿，绝不静默换用新版本 |
 
 - 兼容承诺只认「精确版本仍可用」：即使同主版本的新补丁版存在，也不自动迁移
   进行中的执行，避免错乱重放；
@@ -169,6 +236,9 @@ pending ──▶ running ──▶ succeeded（终态，重启后绝不重放�
 ```
 [durable] idempotency DEDUP idempKey="order-42" -> execution exec-3bf8... (converged)
 [durable] execution=... step=charge RETRY attempt=1/3 backoff=50 retryReason=StepTransient
+[durable] execution=... idempKey="order-42" COMPENSATION started origin=failed trigger=StepPermanent triggerStep="ship"
+[durable] execution=... idempKey="order-42" COMP step=charge RETRY attempt=1/3 backoff=5ms
+[durable] execution=... idempKey="order-42" COMPENSATION_REJECTED versionDecision=version_missing reason=CompDefVersionUnavailable
 [durable] recovery: REJECT execution=... versionDecision=version_incompatible reason=DefVersionIncompatible
 ```
 
@@ -180,7 +250,7 @@ go test ./... -race                # 竞态检测
 go run ./example -dir ./state-demo # 端到端演示（可重复运行验证幂等与恢复）
 ```
 
-测试覆盖（15 个场景）：
+测试覆盖（15 + 8 个场景）：
 
 | 分类 | 测试 |
 | --- | --- |
@@ -195,6 +265,14 @@ go run ./example -dir ./state-demo # 端到端演示（可重复运行验证幂�
 | 定义未知 / 主版本不兼容（启动） | `TestStartRejectsUnknownDefinition`, `TestStartRejectsIncompatibleMajor` |
 | 定义移除 / 主版本升级 / 同主版本版本缺失（恢复） | `TestRecoveryDefinitionRemoved`, `TestRecoveryInFlightMajorIncompatible`, `TestRecoverySameMajorVersionMissing` |
 | 运行期注销定义 | `TestInFlightDefinitionUnregisteredWhileRunning` |
+| 逆序补偿 / 触发原因保留 | `TestCompensationReverseOrder` |
+| 部分步骤未声明补偿（跳过） | `TestCompensationSkipsUndeclared` |
+| 补偿独立重试到上限（独立终态） | `TestCompensationRetryLimit` |
+| 补偿过程中重启恢复 / 不重复补偿 | `TestCompensationRestartResume` |
+| 取消与超时同时触发补偿（收敛） | `TestCompensationCancelTimeoutRace` |
+| 补偿超时释放额度 | `TestCompensationTimeoutReleasesSlot` |
+| 补偿期间钉住版本不可用 | `TestCompensationDefinitionVersionUnavailable` |
+| 运行期注册新版本与补偿并发 | `TestRegisterNewVersionWhileCompensating` |
 
 ## 设计边界
 

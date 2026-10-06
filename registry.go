@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // VersionDecision 为启动/恢复时对定义版本的判定结论。
@@ -21,7 +22,9 @@ const (
 )
 
 // Registry 保存当前进程已知的编排定义，负责版本兼容判定。
+// 运行期注册/注销与并发读取（启动、推进、补偿）可安全并发。
 type Registry struct {
+	mu sync.RWMutex
 	// defs[name][version] = Definition（Definition 注册后视为不可变）。
 	defs map[string]map[string]Definition
 }
@@ -44,6 +47,8 @@ func (r *Registry) Register(d Definition) error {
 			return &RejectError{Code: ReasonDefUnknown, Message: fmt.Sprintf("definition %s has invalid step", d.Name)}
 		}
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	versions, ok := r.defs[d.Name]
 	if !ok {
 		versions = map[string]Definition{}
@@ -70,6 +75,10 @@ func sameSteps(a, b []Step) bool {
 		if a[i].Name != b[i].Name {
 			return false
 		}
+		// 补偿声明也属于步骤签名：同名同版本不得静默改变补偿语义。
+		if (a[i].Compensate == nil) != (b[i].Compensate == nil) {
+			return false
+		}
 	}
 	return true
 }
@@ -77,6 +86,8 @@ func sameSteps(a, b []Step) bool {
 // Resolve 在注册的定义集合中按名称查找，取版本判定结论。
 // 启动路径使用：要求精确版本存在，否则按主版本兼容性给出可区分结论。
 func (r *Registry) Resolve(name string) (Definition, VersionDecision) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	versions, ok := r.defs[name]
 	if !ok || len(versions) == 0 {
 		return Definition{}, VerDefUnknown
@@ -100,6 +111,8 @@ func (r *Registry) Resolve(name string) (Definition, VersionDecision) {
 //  3. 精确版本不存在但主版本相同 -> version_missing（拒绝，不猜测新语义）；
 //  4. 主版本不同 -> version_incompatible（明确拒绝）。
 func (r *Registry) CheckVersion(name, defVersion string) (Definition, VersionDecision) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	versions, ok := r.defs[name]
 	if !ok || len(versions) == 0 {
 		return Definition{}, VerDefUnknown
@@ -154,6 +167,8 @@ func semverMajor(v string) (int, error) {
 
 // Unregister 移除一个已注册定义，用于模拟运行期定义变更。
 func (r *Registry) Unregister(name, version string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if vs, ok := r.defs[name]; ok {
 		delete(vs, version)
 		if len(vs) == 0 {

@@ -24,12 +24,17 @@ const (
 	ExecTimedOut ExecStatus = "timed_out"
 	// ExecRejected 终态：定义未知/版本不兼容等，在启动或恢复时被明确拒绝。
 	ExecRejected ExecStatus = "rejected"
+	// ExecCompensating 正向流程已失败，正在按相反顺序执行已声明的补偿。
+	ExecCompensating ExecStatus = "compensating"
+	// ExecCompensationFailed 终态：补偿本身失败（重试上限/超时/永久失败），
+	// 与正向流程失败（failed/cancelled/timed_out）可区分。
+	ExecCompensationFailed ExecStatus = "compensation_failed"
 )
 
 // Terminal 报告状态是否为终态。终态执行不会再被调度。
 func (s ExecStatus) Terminal() bool {
 	switch s {
-	case ExecSucceeded, ExecFailed, ExecCancelled, ExecTimedOut, ExecRejected:
+	case ExecSucceeded, ExecFailed, ExecCancelled, ExecTimedOut, ExecRejected, ExecCompensationFailed:
 		return true
 	}
 	return false
@@ -69,6 +74,12 @@ const (
 	ReasonDefVersionIncompat  = "DefVersionIncompatible" // 主版本不兼容
 	ReasonDefVersionMissing   = "DefVersionMissing"      // 主版本兼容但精确版本已不存在
 	ReasonIdempotencyConflict = "IdempotencyConflict"    // 同幂等键不同请求负载
+
+	// 补偿相关原因码：与正向流程失败可区分。
+	ReasonCompPermanent      = "CompensationPermanent"          // 补偿动作永久失败
+	ReasonCompRetryExhausted = "CompensationRetryLimitExceeded" // 补偿重试上限耗尽
+	ReasonCompTimeout        = "CompensationTimeout"            // 补偿动作超时
+	ReasonCompDefUnavailable = "CompDefVersionUnavailable"      // 补偿期间钉住的定义版本不可用
 )
 
 // Failure 记录一次失败的分类、原因码与信息。
@@ -96,6 +107,18 @@ const (
 	EvSucceeded      EventType = "succeeded"
 	EvRecovered      EventType = "recovered"
 	EvRunningReset   EventType = "running_step_reset"
+
+	// 补偿（回滚）相关事件。
+	EvCompStarted     EventType = "compensation_started"      // 进入补偿阶段（含触发原因）
+	EvCompStepStarted EventType = "compensation_step_started" // 某步补偿开始（含第几次尝试）
+	EvCompStepOK      EventType = "compensation_step_succeeded"
+	EvCompStepSkipped EventType = "compensation_step_skipped" // 该步未声明补偿，跳过
+	EvCompStepRetry   EventType = "compensation_step_retrying"
+	EvCompStepFailed  EventType = "compensation_step_failed"
+	EvCompStepTimeout EventType = "compensation_step_timed_out"
+	EvCompensated     EventType = "compensated"           // 补偿全部完成，回到正向终态
+	EvCompFailed      EventType = "compensation_failed"   // 补偿本身失败（独立终态）
+	EvCompRejected    EventType = "compensation_rejected" // 补偿期间钉住版本不可用，明确拒绝
 )
 
 // Event 是可解释执行轨迹的一条记录。
@@ -128,6 +151,13 @@ type Step struct {
 	Name    string
 	Timeout time.Duration // 0 表示不设步骤级超时
 	Fn      StepFunc
+
+	// Compensate 为该步声明的失败补偿动作；nil 表示不声明补偿（补偿阶段直接跳过）。
+	// 输入为该步已持久化的输出（无输出时回退为该步输入）。
+	Compensate StepFunc
+	// CompTimeout 为补偿动作的步骤级超时；0 表示不设超时。
+	// 即使补偿函数不理会取消信号，超时后也会尽快给出结论并释放并发额度。
+	CompTimeout time.Duration
 }
 
 // Definition 是一个函数编排的不可变定义（按 名称+语义化版本 标识）。
@@ -159,20 +189,58 @@ type StepState struct {
 	Failure    *Failure        `json:"failure,omitempty"`
 }
 
+// CompStatus 是单个步骤补偿动作的状态。
+type CompStatus string
+
+const (
+	CompPending   CompStatus = "pending"   // 待补偿
+	CompRunning   CompStatus = "running"   // 补偿动作执行中（崩溃恢复时会复位为 pending）
+	CompRetrying  CompStatus = "retrying"  // 补偿退避等待中
+	CompSucceeded CompStatus = "succeeded" // 补偿成功（绝不重复补偿）
+	CompSkipped   CompStatus = "skipped"   // 该步未声明补偿，已跳过
+	CompFailed    CompStatus = "failed"    // 补偿失败（永久/重试上限）
+	CompTimedOut  CompStatus = "timed_out" // 补偿动作超时
+)
+
+// CompState 是某一步补偿动作的持久化进度。
+type CompState struct {
+	Step       string     `json:"step"`
+	Status     CompStatus `json:"status"`
+	Attempts   int        `json:"attempts"`
+	NotBefore  *time.Time `json:"not_before,omitempty"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	Failure    *Failure   `json:"failure,omitempty"`
+}
+
+// CompensationState 是一次执行的补偿（回滚）进度。
+// Steps 按正向步骤的相反顺序排列；Trigger 保留触发补偿的原始原因，绝不覆盖。
+type CompensationState struct {
+	// OriginStatus 为补偿全部完成后应进入的正向终态（failed/cancelled/timed_out）。
+	OriginStatus ExecStatus `json:"origin_status"`
+	// Trigger 为触发补偿的原始失败原因（哪一步失败/超时/取消）。
+	Trigger Failure `json:"trigger"`
+	// TriggerStep 为触发补偿的正向步骤名（取消时可能为空）。
+	TriggerStep string      `json:"trigger_step,omitempty"`
+	Steps       []CompState `json:"steps"`
+}
+
 // Execution 是一次编排实例的完整持久化状态。
 type Execution struct {
-	ID              string          `json:"id"`
-	IdempKey        string          `json:"idemp_key,omitempty"`
-	DefName         string          `json:"def_name"`
-	DefVersion      string          `json:"def_version"`
-	Input           json.RawMessage `json:"input,omitempty"`
-	Status          ExecStatus      `json:"status"`
-	Steps           []StepState     `json:"steps"`
-	Failure         *Failure        `json:"failure,omitempty"`
-	CancelRequested bool            `json:"cancel_requested,omitempty"`
-	CreatedAt       time.Time       `json:"created_at"`
-	UpdatedAt       time.Time       `json:"updated_at"`
-	Rev             int64           `json:"rev"`
+	ID         string          `json:"id"`
+	IdempKey   string          `json:"idemp_key,omitempty"`
+	DefName    string          `json:"def_name"`
+	DefVersion string          `json:"def_version"`
+	Input      json.RawMessage `json:"input,omitempty"`
+	Status     ExecStatus      `json:"status"`
+	Steps      []StepState     `json:"steps"`
+	Failure    *Failure        `json:"failure,omitempty"`
+	// Comp 为补偿（回滚）进度；仅当执行进入补偿阶段后非空。
+	Comp            *CompensationState `json:"comp,omitempty"`
+	CancelRequested bool               `json:"cancel_requested,omitempty"`
+	CreatedAt       time.Time          `json:"created_at"`
+	UpdatedAt       time.Time          `json:"updated_at"`
+	Rev             int64              `json:"rev"`
 }
 
 // IdempotencyClaim 是幂等键的持久化占用记录。
@@ -212,4 +280,7 @@ type Config struct {
 	Dir           string // 本地状态目录
 	MaxConcurrent int    // 同时执行步骤的并发额度，<=0 时取默认值
 	Retry         RetryPolicy
+	// CompRetry 为补偿动作独立的退避重试策略（与正向流程互不影响）；
+	// 零值时使用 DefaultRetryPolicy。
+	CompRetry RetryPolicy
 }

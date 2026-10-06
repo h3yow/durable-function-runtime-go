@@ -131,8 +131,18 @@ func (d *execDriver) driveOnce() (wait time.Duration, terminal bool) {
 	// 定义版本在每次推进前重新判定：进行中的执行只能按启动时钉住的语义继续。
 	def, decision := d.rt.reg.CheckVersion(e.DefName, e.DefVersion)
 	if decision != VerAcceptCompatible {
-		d.rejectInFlight(e, rev, decision)
+		if e.Status == ExecCompensating {
+			// 补偿阶段钉住版本不可用：明确拒绝，原因与补偿执行失败可区分。
+			d.rejectCompensation(e, rev, decision)
+		} else {
+			d.rejectInFlight(e, rev, decision)
+		}
 		return 0, true
+	}
+
+	// 补偿阶段：按相反顺序推进补偿队列，与正向调度互不影响。
+	if e.Status == ExecCompensating {
+		return d.driveCompensation(e, rev, def)
 	}
 
 	idx := nextStepIndex(e)
@@ -150,7 +160,7 @@ func (d *execDriver) driveOnce() (wait time.Duration, terminal bool) {
 
 	// 取消请求优先于任何新的步骤调度。
 	if e.CancelRequested {
-		d.markCancelled(e, rev, idx)
+		d.markCancelled(e, rev, idx, def)
 		return 0, true
 	}
 
@@ -224,22 +234,26 @@ func (d *execDriver) driveOnce() (wait time.Duration, terminal bool) {
 	st.FinishedAt = &finish
 
 	// 取消优先：无论是步骤返回 ctx 取消还是返回普通错误，只要取消意图已持久化，
-	// 立即进入 cancelled 终态，绝不进入重试链路。
+	// 立即进入取消收尾（必要时先补偿），绝不进入重试链路。
 	if e.CancelRequested {
-		d.markCancelled(e, rev, idx)
+		d.markCancelled(e, rev, idx, def)
 		return 0, true
 	}
 
-	// 超时识别为独立终态：立即终止，不进入重试链路。
+	// 超时识别为独立终态：立即终止，不进入重试链路；已成功的步骤先补偿。
 	if sctx2.Err() == context.DeadlineExceeded && ctx.Err() == nil {
 		st.Status = StepTimedOut
 		st.Failure = &Failure{Class: FailureTransient, Code: ReasonStepTimeout, Message: "step deadline exceeded"}
-		e.Status = ExecTimedOut
-		e.Failure = &Failure{
+		trigger := Failure{
 			Class:   FailureTransient,
 			Code:    ReasonStepTimeout,
 			Message: "step " + st.Name + " timed out after " + stepDef.Timeout.String(),
 		}
+		if d.beginCompensation(e, rev, def, ExecTimedOut, trigger, st.Name) {
+			return 0, false
+		}
+		e.Status = ExecTimedOut
+		e.Failure = &trigger
 		e.UpdatedAt = finish
 		d.persist(e, rev)
 		d.logEvent(e, Event{Type: EvStepTimedOut, Step: st.Name, Attempt: st.Attempts, Reason: ReasonStepTimeout})
@@ -288,8 +302,12 @@ func (d *execDriver) driveOnce() (wait time.Duration, terminal bool) {
 
 	if class == FailurePermanent {
 		st.Status = StepFailed
+		trigger := Failure{Class: FailurePermanent, Code: ReasonStepPermanent, Message: callErr.Error()}
+		if d.beginCompensation(e, rev, def, ExecFailed, trigger, st.Name) {
+			return 0, false
+		}
 		e.Status = ExecFailed
-		e.Failure = &Failure{Class: FailurePermanent, Code: ReasonStepPermanent, Message: callErr.Error()}
+		e.Failure = &trigger
 		e.UpdatedAt = finish
 		d.persist(e, rev)
 		d.logEvent(e, Event{Type: EvStepFailed, Step: st.Name, Attempt: st.Attempts, Failure: f, Reason: ReasonStepPermanent})
@@ -323,11 +341,15 @@ func (d *execDriver) driveOnce() (wait time.Duration, terminal bool) {
 		return bo, false
 	}
 
-	// 瞬时失败但已达重试上限：进入可区分终态，不残留重试调度。
+	// 瞬时失败但已达重试上限：进入可区分终态，不残留重试调度；已成功的步骤先补偿。
 	st.Status = StepFailed
-	e.Status = ExecFailed
-	e.Failure = &Failure{Class: FailureTransient, Code: ReasonRetryLimitExceeded,
+	trigger := Failure{Class: FailureTransient, Code: ReasonRetryLimitExceeded,
 		Message: "step " + st.Name + " exhausted " + itoa(st.Attempts) + " attempts"}
+	if d.beginCompensation(e, rev, def, ExecFailed, trigger, st.Name) {
+		return 0, false
+	}
+	e.Status = ExecFailed
+	e.Failure = &trigger
 	e.UpdatedAt = finish
 	d.persist(e, rev)
 	d.logEvent(e, Event{
@@ -366,17 +388,21 @@ func (d *execDriver) rejectInFlight(e *Execution, rev int64, decision VersionDec
 		e.ID, e.IdempKey, decision, code)
 }
 
-func (d *execDriver) markCancelled(e *Execution, rev int64, idx int) {
+func (d *execDriver) markCancelled(e *Execution, rev int64, idx int, def Definition) {
 	now := time.Now().UTC()
-	e.Status = ExecCancelled
-	e.Failure = &Failure{Class: FailurePermanent, Code: ReasonExecutionCancelled, Message: "execution cancelled"}
-	e.UpdatedAt = now
 	for i := idx; i < len(e.Steps); i++ {
 		if e.Steps[i].Status != StepSucceeded {
 			e.Steps[i].Status = StepCancelled
 			e.Steps[i].FinishedAt = &now
 		}
 	}
+	trigger := Failure{Class: FailurePermanent, Code: ReasonExecutionCancelled, Message: "execution cancelled"}
+	if d.beginCompensation(e, rev, def, ExecCancelled, trigger, "") {
+		return
+	}
+	e.Status = ExecCancelled
+	e.Failure = &trigger
+	e.UpdatedAt = now
 	d.persist(e, rev)
 	d.logEvent(e, Event{Type: EvCancelled, Reason: ReasonExecutionCancelled})
 	log.Printf("[durable] execution=%s idempKey=%q CANCELLED", e.ID, e.IdempKey)
